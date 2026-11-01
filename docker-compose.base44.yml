@@ -1,0 +1,72 @@
+# Base44 sandbox stack for OpenCompany (see AGENTS.md).
+#
+# One service runs the checkout from source in dev mode: Vite (HMR) serves the
+# client on container port 5678 and proxies the backend prefixes to uvicorn
+# (--reload) on 5679, so the app keeps the same-origin layout it uses locally.
+# Host port 3000 is the preview entry point.
+#
+#   docker compose -f docker-compose.base44.yml up -d --build
+#
+# Nothing here is used for a real deployment; docker-compose.yml (self-hosting)
+# and the repo's Dockerfile stay untouched.
+name: opencompany-base44
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.base44
+    # Reaps the extra processes the backend spawns (Temporal dev server, bun
+    # executor sidecar, plugin daemons).
+    init: true
+    ports:
+      - "3000:5678"
+    volumes:
+      # The source itself: edits hot-reload and no image rebuild is needed.
+      - .:/app
+      # Runtime state (workflow.db, credentials.db, temporal.db, workspaces,
+      # downloaded CLIs) out of the checkout, so it survives a recreate.
+      - data:/data
+    environment:
+      # Dev port split, as in .env.dev: Vite in front, uvicorn behind it.
+      - VITE_CLIENT_PORT=5678
+      - PYTHON_BACKEND_PORT=5679
+      - PORT=5679
+      - HOST=0.0.0.0
+      - DATA_DIR=/data
+      # Vite appends this to server.allowedHosts; the platform sets it so the
+      # preview host (<port>-<sandbox id>) is accepted.
+      - __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS
+      # Platform-provided; "1" only inside the sandbox preview.
+      - BASE44_PREVIEW_MODE
+      # The preview proxy forwards the page's public Origin but rewrites Host
+      # to the sandbox host, so the backend's same-host WebSocket origin check
+      # (server/services/authz/ws_session.py) rejects the page's sockets unless
+      # the preview origin is listed. Sandbox-only override of the repo's
+      # CORS_ORIGINS; the app's own .env value applies outside the sandbox.
+      - 'CORS_ORIGINS=["http://localhost:5678","http://localhost:5679","http://127.0.0.1:5678","http://127.0.0.1:5679","https://3000-${BASE44_PUBLIC_HOST_SUFFIX}"]'
+      # The venv lives in the bind mount, the uv cache in the container layer:
+      # a hardlink across those filesystems fails, so copy instead.
+      - UV_LINK_MODE=copy
+    command: ["bash", "/app/docker/base44-dev-start.sh"]
+    restart: on-failure
+    stop_grace_period: 30s
+    healthcheck:
+      # Both components of the container are probed; the message says which one
+      # is down. /health (not /health/ready) because readiness also waits for
+      # Temporal, which the backend starts lazily in the background.
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:5678/', timeout=5)"
+          || { echo 'frontend (vite :5678) not serving' >&2; exit 1; };
+          python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:5679/health', timeout=10)"
+          || { echo 'backend (:5679 /health) not responding' >&2; exit 1; }
+      interval: 15s
+      timeout: 15s
+      retries: 8
+      # First boot also installs bun + uv dependencies.
+      start_period: 600s
+
+volumes:
+  data:
